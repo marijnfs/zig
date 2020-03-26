@@ -124,6 +124,9 @@ pub const serializer = @import("io/serialization.zig").serializer;
 pub const Deserializer = @import("io/serialization.zig").Deserializer;
 pub const deserializer = @import("io/serialization.zig").deserializer;
 
+pub const DeserializerAllocate = @import("io/serialization.zig").DeserializerAllocate;
+pub const deserializer_allocate = @import("io/serialization.zig").deserializer_allocate;
+
 pub const BufferedAtomicFile = @import("io/buffered_atomic_file.zig").BufferedAtomicFile;
 
 pub const StreamSource = @import("io/stream_source.zig").StreamSource;

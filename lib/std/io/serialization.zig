@@ -194,6 +194,197 @@ pub fn deserializer(
     return Deserializer(endian, packing, @TypeOf(in_stream)).init(in_stream);
 }
 
+
+/// Creates a deserializer that deserializes types from any stream.
+///  If `is_packed` is true, the data stream is treated as bit-packed,
+///  otherwise data is expected to be packed to the smallest byte.
+///  Types may implement a custom deserialization routine with a
+///  function named `deserialize` in the form of:
+///    pub fn deserialize(self: *Self, deserializer: var) !void
+///  which will be called when the deserializer is used to deserialize
+///  that type. It will pass a pointer to the type instance to deserialize
+///  into and a pointer to the deserializer struct.
+pub fn DeserializerAllocate(comptime endian: builtin.Endian, comptime packing: Packing, comptime InStreamType: type) type {
+    return struct {
+        in_stream: if (packing == .Bit) io.BitInStream(endian, InStreamType) else InStreamType,
+        allocator: *std.mem.Allocator,
+
+        const Self = @This();
+
+        pub fn init(in_stream: InStreamType, allocator: *std.mem.Allocator) Self {
+            return Self{
+                .in_stream = switch (packing) {
+                    .Bit => io.bitInStream(endian, in_stream),
+                    .Byte => in_stream,
+                },
+                .allocator = allocator
+            };
+        }
+
+        pub fn alignToByte(self: *Self) void {
+            if (packing == .Byte) return;
+            self.in_stream.alignToByte();
+        }
+
+        //@BUG: inferred error issue. See: #1386
+        fn deserializeInt(self: *Self, comptime T: type) (InStreamType.Error || error{EndOfStream})!T {
+            comptime assert(trait.is(.Int)(T) or trait.is(.Float)(T));
+
+            const u8_bit_count = 8;
+            const t_bit_count = comptime meta.bitCount(T);
+
+            const U = std.meta.IntType(false, t_bit_count);
+            const Log2U = math.Log2Int(U);
+            const int_size = (U.bit_count + 7) / 8;
+
+            if (packing == .Bit) {
+                const result = try self.in_stream.readBitsNoEof(U, t_bit_count);
+                return @bitCast(T, result);
+            }
+
+            var buffer: [int_size]u8 = undefined;
+            const read_size = try self.in_stream.read(buffer[0..]);
+            if (read_size < int_size) return error.EndOfStream;
+
+            if (int_size == 1) {
+                if (t_bit_count == 8) return @bitCast(T, buffer[0]);
+                const PossiblySignedByte = std.meta.IntType(T.is_signed, 8);
+                return @truncate(T, @bitCast(PossiblySignedByte, buffer[0]));
+            }
+
+            var result = @as(U, 0);
+            for (buffer) |byte, i| {
+                switch (endian) {
+                    .Big => {
+                        result = (result << u8_bit_count) | byte;
+                    },
+                    .Little => {
+                        result |= @as(U, byte) << @intCast(Log2U, u8_bit_count * i);
+                    },
+                }
+            }
+
+            return @bitCast(T, result);
+        }
+
+        /// Deserializes and returns data of the specified type from the stream
+        pub fn deserialize(self: *Self, comptime T: type) !T {
+            var value: T = undefined;
+            try self.deserializeInto(&value);
+            return value;
+        }
+
+        /// Deserializes data into the type pointed to by `ptr`
+        pub fn deserializeInto(self: *Self, ptr: var) !void {
+            const T = @TypeOf(ptr);
+            comptime assert(trait.is(.Pointer)(T));
+
+            if (comptime trait.isSlice(T) or comptime trait.isPtrTo(.Array)(T)) {
+                for (ptr) |*v|
+                    try self.deserializeInto(v);
+                return;
+            }
+
+            comptime assert(trait.isSingleItemPtr(T));
+
+            const C = comptime meta.Child(T);
+            const child_type_id = @typeInfo(C);
+
+            //custom deserializer: fn(self: *Self, deserializer: var) !void
+            if (comptime trait.hasFn("deserialize")(C)) return C.deserialize(ptr, self);
+
+            if (comptime trait.isPacked(C) and packing != .Bit) {
+                var packed_deserializer = deserializer_allocate(endian, .Bit, self.in_stream, self.allocator);
+                return packed_deserializer.deserializeInto(ptr);
+            }
+
+            switch (child_type_id) {
+                .Void => return,
+                .Bool => ptr.* = (try self.deserializeInt(u1)) > 0,
+                .Float, .Int => ptr.* = try self.deserializeInt(C),
+                .Struct => {
+                    const info = @typeInfo(C).Struct;
+
+                    inline for (info.fields) |*field_info| {
+                        const name = field_info.name;
+                        const FieldType = field_info.field_type;
+
+                        if (FieldType == void or FieldType == u0) continue;
+
+                        //It doesn't make sense to write pointers
+                        if (comptime trait.isIndexable(FieldType)) {
+                            var N: usize = undefined;
+                            try self.deserializeInto(&N);
+                            @field(ptr, name) = try self.allocator.alloc(meta.Child(FieldType), N);
+
+                            var i: usize = 0;
+                            while (i < N) : (i += 1) {
+                                try self.deserializeInto(&@field(ptr, name)[i]);
+                            }
+                        } else if (comptime trait.is(.Pointer)(FieldType)) {
+                            continue;
+                        } else {
+                            try self.deserializeInto(&@field(ptr, name));
+                        }
+                    }
+                },
+                .Union => {
+                    const info = @typeInfo(C).Union;
+                    if (info.tag_type) |TagType| {
+                        //we avoid duplicate iteration over the enum tags
+                        // by getting the int directly and casting it without
+                        // safety. If it is bad, it will be caught anyway.
+                        const TagInt = @TagType(TagType);
+                        const tag = try self.deserializeInt(TagInt);
+
+                        inline for (info.fields) |field_info| {
+                            if (field_info.enum_field.?.value == tag) {
+                                const name = field_info.name;
+                                const FieldType = field_info.field_type;
+                                ptr.* = @unionInit(C, name, undefined);
+                                try self.deserializeInto(&@field(ptr, name));
+                                return;
+                            }
+                        }
+                        //This is reachable if the enum data is bad
+                        return error.InvalidEnumTag;
+                    }
+                    @compileError("Cannot meaningfully deserialize " ++ @typeName(C) ++
+                        " because it is an untagged union. Use a custom deserialize().");
+                },
+                .Optional => {
+                    const OC = comptime meta.Child(C);
+                    const exists = (try self.deserializeInt(u1)) > 0;
+                    if (!exists) {
+                        ptr.* = null;
+                        return;
+                    }
+
+                    ptr.* = @as(OC, undefined); //make it non-null so the following .? is guaranteed safe
+                    const val_ptr = &ptr.*.?;
+                    try self.deserializeInto(val_ptr);
+                },
+                .Enum => {
+                    var value = try self.deserializeInt(@TagType(C));
+                    ptr.* = try meta.intToEnum(C, value);
+                },
+                else => {
+                    @compileError("Cannot deserialize " ++ @tagName(child_type_id) ++ " types (unimplemented).");
+                },
+            }
+        }
+    };
+}
+
+pub fn deserializer_allocate(
+    comptime endian: builtin.Endian,
+    comptime packing: Packing,
+    in_stream: var,
+    allocator: *std.mem.Allocator
+) DeserializerAllocate(endian, packing, @TypeOf(in_stream)) {
+    return DeserializerAllocate(endian, packing, @TypeOf(in_stream)).init(in_stream, allocator);
+}
+
 /// Creates a serializer that serializes types to any stream.
 ///  If `is_packed` is true, the data will be bit-packed into the stream.
 ///  Note that the you must call `serializer.flush()` when you are done
@@ -293,12 +484,17 @@ pub fn Serializer(comptime endian: builtin.Endian, comptime packing: Packing, co
                         if (FieldType == void or FieldType == u0) continue;
 
                         //It doesn't make sense to write pointers
-                        if (comptime trait.is(.Pointer)(FieldType)) {
-                            @compileError("Will not " ++ "serialize field " ++ name ++
-                                " of struct " ++ @typeName(T) ++ " because it " ++
-                                "is of pointer-type " ++ @typeName(FieldType) ++ ".");
+                        if (comptime trait.isIndexable(FieldType)) {
+                            try self.serialize(@field(value, name).len);
+                            var i: usize = 0;
+                            while (i < @field(value, name).len) : (i += 1) {
+                                try self.serialize(@field(value, name)[i]);
+                            }
+                        } else if (comptime trait.is(.Pointer)(FieldType)) {
+                            continue;
+                        } else {
+                            try self.serialize(@field(value, name));
                         }
-                        try self.serialize(@field(value, name));
                     }
                 },
                 .Union => {
